@@ -11,7 +11,8 @@ Source:
 Owner review on 2026-11-25 (before results): every proposed decision D-001 to D-043 is
 accepted, except those marked **superseded** or **amended** below; the changes are
 D-044 to D-059. Superseded entries stay in the log unchanged apart from that mark.
-Later entries marked **proposed** still need review.
+Later entries marked **proposed** still need review. Owner review 2 (D-060 to D-065)
+and owner review 3 (see that section) are also before results.
 
 ## Infrastructure
 
@@ -233,7 +234,7 @@ Later entries marked **proposed** still need review.
 
 ### D-041 LLM diagnoses run 3 times; sample 1 is scored
 - 2026-11-25, before results, proposed.
-- **Superseded by D-056.**
+- **Superseded by D-056** (itself amended by D-063).
 - Samples 2 and 3 only for agreement rates.
 
 ### D-042 Dev/test split and freeze
@@ -290,6 +291,7 @@ All entries below: 2026-11-25, before results.
 - full: everything including Prometheus `up`, docker stats, vmstat. app-only:
   traces, service metrics, loadgen requests. Definitions in PLAN.md.
 - The full view is used for the primary comparison; app-only is descriptive.
+- **Confirmed by D-065.**
 
 ### D-051 Metrics
 - Owner. Supersedes D-038.
@@ -325,7 +327,7 @@ All entries below: 2026-11-25, before results.
   in its lower price band (its price is higher above 100k tokens).
 
 ### D-056 LLM budget allocation
-- Proposed, **pending owner confirmation**. Supersedes D-041.
+- Proposed; accepted with changes in D-063. Supersedes D-041.
 - Estimate (list prices read 2026-11-25, 8k input and 1.5k output tokens per call):
   Opus 5.5 on all 140 runs x 2 views is about USD 17, far over the cap.
 - Proposal: Haiku 5.5 on all test runs, both views, sample 1. Opus 5.5 on a seeded
@@ -347,3 +349,157 @@ All entries below: 2026-11-25, before results.
 ### D-059 Test set size confirmed
 - Owner. Confirms D-031.
 - 20 runs per fault plus 20 controls.
+
+## Owner review 2, 2026-11-25
+
+All entries below: 2026-11-25, before results.
+
+### D-060 All test-set LLM calls to Anthropic use the Message Batches API
+- **Accepted** (owner review 3).
+- Owner.
+- 50% discount on all tokens. Dev prompt development uses the normal Messages API.
+  A batch request that errors or expires for infrastructure reasons is resubmitted
+  once; that is not a re-run of a model answer. Batch requests cannot set `fallbacks`
+  or `stream`; neither is used.
+
+### D-061 LLM request settings: effort low, max_tokens 8000
+- **Accepted** (owner review 3); README limitation added by D-084.
+- Owner (set an explicit limit); proposed (values).
+- What the API offers (checked 2026-11-25 against the Claude API reference): on
+  Opus 5.5 thinking is always on; `thinking: {type: "disabled"}` and a thinking token
+  budget (`budget_tokens`) are both rejected with a 400. The control is
+  `output_config.effort` (`low`, `medium`, `high`, `xhigh`, `max`; default `medium`).
+  `max_tokens` is a hard ceiling on thinking plus answer. Task budgets (beta) are
+  advisory, meant for agent loops, minimum 20,000 tokens; not useful here.
+- Set: `output_config.effort = "low"` and `max_tokens = 8000` for Opus 5.5 and Haiku
+  5.5 (Haiku 5.5 also defaults to `medium`). Same settings for both, so the models
+  differ only in the model. Results therefore describe effort low.
+- `max_tokens` is revisited after the pre-freeze measurement (D-064).
+- A response ending in `max_tokens` or `refusal`, or not parsing, counts as an
+  incorrect diagnosis, is not re-run, and is counted per model.
+
+### D-062 Batch chunks sized to the remaining budget
+- **Accepted** (owner review 3).
+- Proposed (follows from D-054 and D-060).
+- A batch is submitted in chunks whose summed worst-case reservation fits in the
+  remaining budget; reservations are replaced by actual cost when a chunk returns.
+  Without this, reserving all 60 Opus calls at `max_tokens` would exceed the cap.
+
+### D-063 Opus 5.5 subset: 60 runs
+- **Accepted** (owner review 3).
+- Owner. Amends D-056.
+- Seeded, stratified: 8 runs per fault plus 12 controls, drawn and logged before the
+  freeze. Opus 5.5 stays descriptive, not in the primary test family. Haiku 5.5
+  agreement samples and evidence-window cuts use the same 60 runs. Estimated total
+  with batch prices: EUR 2.70 plus EUR 0.30 reserve (PLAN.md).
+
+### D-064 Pre-freeze cost measurement; stop if the cap breaks
+- **Accepted** (owner review 3).
+- Owner.
+- 5 dev calls per test-set model, final prompt and settings, same API path as the
+  test set. Input, output and thinking tokens (`usage.output_tokens_details`
+  where the response has it), stop reason and cost recorded. The allocation is
+  recomputed from measured values. If it exceeds EUR 3, work stops and the owner is
+  told; the subset, effort, `max_tokens` and prompt are not changed to make it fit.
+
+### D-065 Full view primary, app-only descriptive
+- **Accepted** (owner review 3).
+- Owner. Confirms D-050.
+
+## Stage 1 design (proposed)
+
+All entries below: 2026-11-25, before results, proposed. Details in STAGE1.md.
+Entries marked **accepted** were accepted in owner review 3; the rest still need
+review.
+
+### D-066 One package, one image for all Python services
+- gateway, checker, mock_llm and loadgen share one image; the command selects the
+  service. Less build time and disk; one lock file.
+
+### D-067 stress-ng in the shared image
+- Needed in the checker for F4. Present in all Python containers, unused elsewhere.
+
+### D-068 Admin endpoints as a second uninstrumented server in the same process
+- Separate port, not traced, not in metrics, not routed through Toxiproxy.
+
+### D-069 Prometheus metrics are server-side only, plus checker verdicts
+- No client-side metrics for outgoing calls. Redis, checker and LLM call errors and
+  retries are visible only in spans. Keeps F5 silent at the metric level as designed
+  (D-045) and gives a clear split between metric-only and trace-based evidence.
+
+### D-070 Tracing setup
+- OpenTelemetry auto-instrumentation for FastAPI, httpx and redis; OTLP over HTTP to
+  Jaeger; batch span processor with 1 s delay; manual attributes listed in STAGE1.md;
+  no attribute names a fault.
+
+### D-071 One uvicorn worker per service
+- Simple CPU behaviour under the `cpus` caps. The capacity test shows whether it
+  limits throughput at the chosen rate.
+
+### D-072 Synthetic prompt set
+- About 2,000 prompts from templates with a fixed seed, about 5% malicious. No
+  external dataset. `prompt_id` and `prompt_label` are removed from both RCA views.
+
+### D-073 Checker scoring and CPU work
+- Keyword weights plus a deterministic hash term in [0, 0.3); normal threshold 0.9;
+  block-all threshold 0.0. CPU work as SHA-256 iterations, calibrated once on the
+  server to about 5 ms, then fixed.
+
+### D-074 mock_llm latency model
+- **Accepted** (owner review 3).
+- Lognormal, median 300 ms, sigma 0.5, seeded by (run seed, request id), so a
+  request has the same latency on every run.
+
+### D-075 Load generator details
+- Open loop, 50 client ids, in-flight cap 500 (overflow counted), client timeout
+  15 s, schedule lag recorded; p99 lag under 50 ms required at the chosen rate.
+
+### D-076 Redis rate limit 1000 per client per minute
+- Never triggers at the planned load; the baseline check confirms zero 429s.
+
+### D-077 Published ports
+- 127.0.0.1 only: 18080 gateway entry, 16686 Jaeger, 9090 Prometheus, 8474
+  Toxiproxy API, 19002 checker admin, 19003 mock_llm admin. Redis not published.
+
+### D-078 Baseline noise check: 3 sessions
+- **Accepted** (owner review 3).
+- 3 sessions of 10 min at different times of day, to see between-session steal
+  variation. One session is enough for the done test.
+
+### D-079 Capacity test procedure
+- **Accepted, amended by D-083** (owner review 3).
+- Steps 5, 10, 20, 40, 80 requests per second, 60 s each. Saturation: gateway p95
+  above twice the 5 rps value, 5xx above 1%, or loadgen p99 lag above 50 ms.
+
+### D-080 Unit tests run on the Mac without Docker
+- FastAPI test client, fakeredis, respx. Integration tests only on the server.
+
+### D-081 Image versions pinned by tag and digest
+- Recorded in each run manifest.
+
+### D-082 Restart policy `no` for every container
+- **Accepted** (owner review 3).
+- A killed container stays down until the injector restarts it; an unplanned crash
+  is visible instead of hidden by a restart.
+
+## Owner review 3, 2026-11-25
+
+All entries below: 2026-11-25, before results.
+
+Accepted: D-060 to D-065, D-074, D-078, D-082; D-061 with D-084; D-079 with D-083.
+D-069 not yet accepted (owner asked for the full text first). D-066 to D-068, D-070
+to D-073, D-075 to D-077, D-080 and D-081 still need review.
+
+### D-083 Experiment load rate: 50% of the measured saturation rate, rounded down
+- Owner. Amends D-079 (replaces "30 to 40%" in STAGE1.md and PLAN.md).
+- Saturation rate as defined in D-079 (lowest step that meets a saturation
+  condition). Load rate = 50% of it, rounded down to a whole number of requests per
+  second.
+- The measured saturation rate, the step results and the chosen load rate are logged
+  here as a new entry when the capacity test runs (stage 1, step 11). That entry is
+  marked after results (capacity measurement); no RCA results exist at that point.
+
+### D-084 README limitation: effort low
+- Owner. Adds to D-061.
+- The README limitations (stage 6) state that results describe Haiku 5.5 and Opus
+  5.5 at `effort = "low"`, not each model's best configuration.
