@@ -4,6 +4,9 @@ A benchmark for root cause analysis (RCA) on a small AI microservice system. Kno
 faults are injected, ground truth is logged by the injector, and RCA methods (rule
 baseline, statistical, LLM) are scored on the same recordings of traces and metrics.
 
+**Scope:** the benchmark measures fault localisation, not detection. RCA methods are
+told when the incident started and must find which component caused it.
+
 **Status:** stage 0 (plan). Nothing is built or measured yet. No results.
 
 - [PLAN.md](PLAN.md): stages, deliverables, done tests, planned metrics

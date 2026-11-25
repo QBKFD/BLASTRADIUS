@@ -6,16 +6,20 @@ stage 2; any difference is written here and marked "revised after dev runs".
 
 RCA methods are not given this file.
 
+Topology (D-044): the gateway orchestrates. Per request it increments a Redis
+counter, asks the checker for a verdict, and if allowed calls mock_llm itself. The
+checker makes no outgoing calls. Symptoms below follow from that.
+
 ## Summary
 
-| ID | Name                | Difficulty         | Component | Fault type        | Injection                          |
-|----|---------------------|--------------------|-----------|-------------------|------------------------------------|
-| F1 | llm_outage_503      | easy               | mock_llm  | error_responses   | mock_llm admin: 503 on 100%        |
-| F2 | redis_down          | easy               | redis     | unavailable       | `docker compose stop redis`        |
-| F3 | llm_rate_limit_429  | propagating        | mock_llm  | rate_limited      | mock_llm admin: token bucket       |
-| F4 | checker_cpu_pressure| propagating        | checker   | cpu_saturation    | `stress-ng` in checker container   |
-| F5 | checker_crash       | silent/misleading  | checker   | unavailable       | `docker kill -s KILL checker`      |
-| F6 | checker_bad_config  | silent/misleading  | checker   | misconfiguration  | block-all policy file + reload     |
+| ID | Name                 | Difficulty        | Component | Fault type       | Injection                        |
+|----|----------------------|-------------------|-----------|------------------|----------------------------------|
+| F1 | llm_outage_503       | easy              | mock_llm  | error_responses  | mock_llm admin: 503 on 100%      |
+| F2 | redis_down           | easy              | redis     | unavailable      | `docker compose stop redis`      |
+| F3 | llm_rate_limit_429   | propagating       | mock_llm  | rate_limited     | mock_llm admin: token bucket     |
+| F4 | checker_cpu_pressure | propagating       | checker   | cpu_saturation   | `stress-ng` in checker container |
+| F5 | checker_crash        | silent/misleading | checker   | unavailable      | `docker kill -s KILL checker`    |
+| F6 | checker_bad_config   | silent/misleading | checker   | misconfiguration | block-all policy file + reload   |
 
 Fault duration: 120 s for every fault (see PLAN.md, experiment protocol).
 
@@ -34,10 +38,12 @@ exactly the six injected pairs.
 
 - Load: open-loop Poisson at a fixed rate (set in stage 1). About 95% benign prompts,
   5% malicious.
-- gateway: 200 for allowed prompts, 403 for blocked (about 5%), no 5xx.
-- checker: verdict "allow" about 95%, "block" about 5%; forwards allowed prompts.
-- mock_llm: receives about 95% of the gateway rate, latency from a lognormal
-  (median about 300 ms, set in stage 1).
+- gateway: 200 for allowed prompts, 403 for blocked (about 5%), no 5xx. Its latency
+  is Redis + checker + (for allowed prompts) mock_llm.
+- checker: receives every request that passes the Redis step; verdict "allow" about
+  95%, "block" about 5%; latency about the fixed CPU work (about 5 ms).
+- mock_llm: receives about 95% of the gateway rate (allowed prompts only), latency
+  from a lognormal (median about 300 ms, set in stage 1).
 - redis: one INCR plus EXPIRE per gateway request.
 - Errors: 5xx counts are errors; 403 blocks are not errors.
 
@@ -81,13 +87,13 @@ Written by the injector into `recordings/<run_id>/ground_truth.json`:
 - **Expected symptoms:**
   - mock_llm: 503 on all requests; server latency drops (fails fast); request rate
     unchanged (503 is not retried).
-  - checker: LLM client spans end with 503; checker returns 502 for every allowed
-    prompt; server error rate about 95%; latency drops. Blocked prompts still get 403.
-  - gateway: 502 to the client for about 95% of requests; latency drops.
+  - gateway: mock_llm client spans end with 503; 502 to the client for about 95% of
+    requests (all allowed prompts); blocked prompts still get 403; latency drops.
+  - checker: unchanged (traffic, verdicts, latency).
   - redis: unchanged.
   - client: about 95% 5xx.
-- **Misleading signals:** errors appear at three levels (mock_llm, checker, gateway).
-  A "component with most errors" rule could pick gateway or checker.
+- **Misleading signals:** errors appear at gateway and mock_llm. A "component with
+  most errors" or "entry point with errors" rule could pick gateway.
 
 ## F2 redis_down (easy)
 
@@ -96,12 +102,12 @@ Written by the injector into `recordings/<run_id>/ground_truth.json`:
 - **Revert:** `docker compose start redis`; PING succeeds; gateway health OK.
 - **Ground truth:** `redis`, `unavailable`.
 - **Expected symptoms:**
-  - redis: no data (no exporter); its container disappears from running containers in
-    `docker stats`.
+  - redis: no data (no exporter); full view only: its container disappears from
+    running containers in `docker stats`.
   - gateway: 503 on every request; Redis client spans end with a connection error
     (through Toxiproxy this is likely a reset or EOF, not "refused"); latency drops to
     about the Redis client timeout (50 ms) or less.
-  - checker: request rate falls to about 0.
+  - checker: request rate falls to about 0 (the Redis step comes first).
   - mock_llm: request rate falls to about 0.
   - client: about 100% 503.
 - **Misleading signals:** the only component returning errors is gateway. checker and
@@ -117,19 +123,17 @@ Written by the injector into `recordings/<run_id>/ground_truth.json`:
 - **Revert:** `POST /admin/reset`, read back `none`.
 - **Ground truth:** `mock_llm`, `rate_limited`.
 - **Expected symptoms:**
-  - mock_llm: mix of 200 and 429; request rate goes up because of checker retries
+  - mock_llm: mix of 200 and 429; request rate goes up because of gateway retries
     (up to 3 attempts per prompt); latency of successful calls about normal.
-  - checker: latency up by backoff and Retry-After waits (up to about 2 s extra); part
-    of the allowed prompts end in 502 after the last retry; the checker looks slow.
-  - gateway: p95 and p99 latency up; part of the requests return 502. The gateway
-    timeout to the checker (5 s, set in stage 1) is above the checker's worst-case
-    retry time, so timeouts and fail-closed blocks should not happen. If dev runs
-    show blocks, this is revised.
+  - gateway: latency up by backoff and Retry-After waits (up to about 2 s extra);
+    part of the requests return 502 after the last retry; several mock_llm client
+    spans per request, most ending in 429.
+  - checker: unchanged.
   - redis: unchanged.
   - client: higher tail latency, partial 5xx.
-- **Misleading signals:** the extra latency sits inside checker spans (backoff waits),
-  so exclusive-time analysis may blame the checker. The 429 child spans point to
-  mock_llm.
+- **Misleading signals:** the extra latency is backoff waiting inside gateway spans,
+  between the mock_llm client spans, so exclusive-time analysis may blame the
+  gateway. The 429 client spans point to mock_llm.
 
 ## F4 checker_cpu_pressure (propagating)
 
@@ -141,16 +145,19 @@ Written by the injector into `recordings/<run_id>/ground_truth.json`:
   are left.
 - **Ground truth:** `checker`, `cpu_saturation`.
 - **Expected symptoms:**
-  - checker: server latency up, mostly as exclusive time (the fixed CPU work per
-    request takes about 3 times longer, plus CPU throttling); LLM child spans normal;
+  - checker: server latency up (the fixed CPU work per request takes about 3 times
+    longer, plus CPU throttling and queueing); no errors; full view only:
     `docker stats` CPU near the 1.0 limit.
-  - gateway: latency up (waits on checker); a few fail-closed blocks if the checker
-    tail exceeds the gateway timeout (not expected at 5 s).
-  - mock_llm: request rate about unchanged, latency normal.
+  - gateway: latency up (waits on the checker). If checker latency exceeds the 1 s
+    gateway timeout, the gateway fails closed and returns 403 for those requests.
+    At the planned load this should affect at most the tail; dev runs will show.
+  - mock_llm: request rate about unchanged (slightly lower if some requests are
+    blocked by fail closed), latency normal.
   - redis: unchanged.
-  - client: higher latency, few or no errors.
-- **Misleading signals:** gateway latency rises too. One extra busy core may raise
-  host CPU steal and slow other containers a little.
+  - client: higher latency, few or no errors, possibly a small rise in 403.
+- **Misleading signals:** gateway latency rises too. Any fail-closed blocks look like
+  F5 or F6 on a small scale. One extra busy core may raise host CPU steal and slow
+  other containers a little.
 
 ## F5 checker_crash (silent/misleading)
 
@@ -160,8 +167,9 @@ Written by the injector into `recordings/<run_id>/ground_truth.json`:
 - **Revert:** `docker start checker`, wait for its health check.
 - **Ground truth:** `checker`, `unavailable`.
 - **Expected symptoms:**
-  - checker: no spans, no metrics; Prometheus `up{job="checker"}` is 0; the container
-    disappears from running containers in `docker stats`.
+  - checker: no spans, its metric series stop; full view only: Prometheus
+    `up{job="checker"}` is 0 and the container disappears from running containers in
+    `docker stats`.
   - gateway: checker client spans end with a connection error; fail closed, so every
     request gets 403 "blocked"; no 5xx; latency drops (no LLM call).
   - mock_llm: request rate falls to about 0.
@@ -169,8 +177,8 @@ Written by the injector into `recordings/<run_id>/ground_truth.json`:
   - client: about 100% 403, no errors.
 - **Misleading signals:** from the client side it looks the same as F6 or as a wave of
   malicious prompts. Error-rate rules see nothing. mock_llm traffic drop could be read
-  as a mock_llm problem. Distinguishing signals: `up` = 0, gateway client span errors,
-  no checker verdict metrics.
+  as a mock_llm problem. Distinguishing signals: gateway client span errors, no
+  checker spans, checker series stop (and `up` = 0 in the full view).
 
 ## F6 checker_bad_config (silent/misleading)
 
@@ -182,13 +190,14 @@ Written by the injector into `recordings/<run_id>/ground_truth.json`:
 - **Ground truth:** `checker`, `misconfiguration`.
 - **Expected symptoms:**
   - checker: up and serving; verdict "block" on 100% of prompts; no errors; latency
-    drops (no LLM call); spans carry the verdict.
-  - gateway: 403 on every request; no errors; latency drops.
+    unchanged; spans carry the verdict.
+  - gateway: 403 on every request; no errors; latency drops (no LLM call).
   - mock_llm: request rate falls to about 0.
   - redis: unchanged.
   - client: about 100% 403, no errors.
 - **Misleading signals:** no errors anywhere. mock_llm traffic drop could be read as a
-  mock_llm problem. Client view is the same as F5. Distinguishing signals: checker up,
-  checker verdict counter for "block" rising.
+  mock_llm problem. Client view is the same as F5. Distinguishing signals: checker up
+  and answering, checker verdict counter for "block" rising, checker spans present
+  with verdict "block".
 - **Note:** no config version metric or change log is given to RCA methods in the
   initial setup (see DECISIONS.md D-027).
